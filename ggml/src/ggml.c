@@ -5526,6 +5526,43 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_add_rel_bias(
+        struct ggml_tensor * a,
+        struct ggml_tensor * rel_table,
+        struct ggml_tensor * k_pos,
+        struct ggml_tensor * q_pos) {
+    if (!rel_table) {
+        a->src[6] = NULL;
+        a->src[7] = NULL;
+        a->src[8] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(k_pos != NULL && q_pos != NULL);
+
+    const struct ggml_tensor * q       = a->src[0];
+    const struct ggml_tensor * k       = a->src[1];
+    const struct ggml_tensor * kv_rows = a->src[5];
+    const int64_t n_kv_cols            = kv_rows ? kv_rows->ne[0] : k->ne[1];
+
+    GGML_ASSERT(rel_table->type == GGML_TYPE_F32 && ggml_is_contiguous(rel_table));
+    GGML_ASSERT(rel_table->ne[0] >= 2);
+    GGML_ASSERT(rel_table->ne[1] == q->ne[2]);
+    GGML_ASSERT(rel_table->ne[2] == q->ne[1]);
+    GGML_ASSERT(rel_table->ne[3] == q->ne[3]);
+
+    GGML_ASSERT(k_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(k_pos));
+    GGML_ASSERT(k_pos->ne[0] == n_kv_cols && k_pos->ne[1] == q->ne[3]);
+
+    GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos));
+    GGML_ASSERT(q_pos->ne[0] == q->ne[1] && q_pos->ne[1] == q->ne[3]);
+
+    a->src[6] = rel_table;
+    a->src[7] = k_pos;
+    a->src[8] = q_pos;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

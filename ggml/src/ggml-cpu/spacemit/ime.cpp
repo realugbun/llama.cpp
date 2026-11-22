@@ -952,6 +952,9 @@ class tensor_traits_common : public tensor_traits_base {
     bool work_size(int n_threads, const ggml_tensor * op, size_t & size) override {
         switch (op->op) {
             case GGML_OP_FLASH_ATTN_EXT:
+                if (op->src[5] != nullptr || op->src[6] != nullptr) {
+                    return false;
+                }
                 {
                     const int     n_tasks = n_threads;
                     const int64_t neq2    = op->src[0]->ne[2];  // number of query heads
@@ -1047,8 +1050,8 @@ class tensor_traits_common : public tensor_traits_base {
                         return true;
                 }
             case GGML_OP_FLASH_ATTN_EXT:
-                // K/V row lists are handled by the generic CPU path
-                if (op->src[5] != nullptr) {
+                // K/V row lists and on-the-fly relative bias are handled by the generic CPU path
+                if (op->src[5] != nullptr || op->src[6] != nullptr) {
                     return false;
                 }
                 forward_flash_attn_ext_f16(params, op);
@@ -1662,7 +1665,6 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             case GGML_OP_SUB:
             case GGML_OP_MUL:
             case GGML_OP_DIV:
-            case GGML_OP_FLASH_ATTN_EXT:
             case GGML_OP_CONT:
             case GGML_OP_CPY:
             case GGML_OP_REPEAT:
@@ -1670,6 +1672,11 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             case GGML_OP_GET_ROWS:
             case GGML_OP_CONCAT:
             case GGML_OP_GATED_DELTA_NET:
+                return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
+            case GGML_OP_FLASH_ATTN_EXT:
+                if (op->src[5] != nullptr || op->src[6] != nullptr) {
+                    return nullptr;
+                }
                 return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
             default:
                 // GGML_ABORT("fatal error");

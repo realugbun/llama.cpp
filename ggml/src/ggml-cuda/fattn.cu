@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-f16-rel.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -552,10 +553,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE    =   0,
-    BEST_FATTN_KERNEL_TILE    = 200,
-    BEST_FATTN_KERNEL_VEC     = 100,
-    BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_NONE        =   0,
+    BEST_FATTN_KERNEL_TILE        = 200,
+    BEST_FATTN_KERNEL_VEC         = 100,
+    BEST_FATTN_KERNEL_MMA_F16     = 400,
+    BEST_FATTN_KERNEL_MMA_F16_REL = 500,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -667,6 +669,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // On-the-fly Inkling-2 relative-position bias + direct F8_E4M3 / Q8_0 / F16 KV loader
+    if (dst->src[6] != nullptr) {
+        return ggml_cuda_flash_attn_ext_mma_f16_rel_supported(device, dst)
+            ? BEST_FATTN_KERNEL_MMA_F16_REL
+            : BEST_FATTN_KERNEL_NONE;
     }
 
     if (mask && mask->ne[2] != 1) {
@@ -803,6 +812,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_MMA_F16_REL:
+            need_f16_K = (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_F8_E4M3 && K->type != GGML_TYPE_Q8_0);
+            need_f16_V = (V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_F8_E4M3 && V->type != GGML_TYPE_Q8_0);
+            break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
@@ -831,6 +844,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16_REL:
+            ggml_cuda_flash_attn_ext_mma_f16_rel(ctx, dst);
             break;
     }
 }

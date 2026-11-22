@@ -9650,6 +9650,154 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with on-the-fly relative-position bias (ggml_flash_attn_ext_add_rel_bias)
+struct test_flash_attn_ext_rel_bias : public test_case {
+    const int64_t   hs;
+    const int64_t   nh;        // K/V heads
+    const int64_t   gqa;
+    const int64_t   kv;        // KV length per stream
+    const int64_t   nb;        // queries per stream (n_q)
+    const int64_t   n_streams;
+    const int64_t   extent;    // relative-position extent (rel_table ne[0] = extent + 1)
+    const ggml_type type_KV;
+    const bool      mask_bcast_stream;
+    const bool      nonzero_sinks;
+    const float     const_v;   // if > 0, fill V with constant high-finite value (tests FP32 combine overflow safety)
+
+    std::string vars() override {
+        std::string res = VARS_TO_STR8(hs, nh, gqa, kv, nb, n_streams, extent, type_KV);
+        if (mask_bcast_stream) res += ",mask_bcast_stream=1";
+        if (nonzero_sinks)     res += ",nonzero_sinks=1";
+        if (const_v > 0.0f)    res += ",const_v=" + std::to_string((int) const_v);
+        return res;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_rel_bias(
+            int64_t hs = 128, int64_t nh = 2, int64_t gqa = 3,
+            int64_t kv = 256, int64_t nb = 16, int64_t n_streams = 1,
+            int64_t extent = 64, ggml_type type_KV = GGML_TYPE_F16,
+            bool mask_bcast_stream = false, bool nonzero_sinks = false, float const_v = 0.0f)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_streams(n_streams), extent(extent),
+          type_KV(type_KV), mask_bcast_stream(mask_bcast_stream), nonzero_sinks(nonzero_sinks), const_v(const_v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_head_q = nh * gqa;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, n_head_q, n_streams);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, n_streams);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, n_streams);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, mask_bcast_stream ? 1 : n_streams);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head_q);
+        ggml_set_name(s, "s");
+
+        ggml_tensor * rel_table = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, extent + 1, n_head_q, nb, n_streams);
+        ggml_set_name(rel_table, "rel_table");
+
+        ggml_tensor * k_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, n_streams);
+        ggml_set_name(k_pos, "k_pos");
+
+        ggml_tensor * q_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nb, n_streams);
+        ggml_set_name(q_pos, "q_pos");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f / sqrtf((float) hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_add_rel_bias(out, rel_table, k_pos, q_pos);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x52454C32);
+        std::uniform_real_distribution<float> dis_bias(-1.5f, 1.5f);
+
+        // Build per-stream k_pos and q_pos so early 64-key tiles are all-far (dist >= extent,
+        // exercising warp_all_far), later tiles mix near/far/boundary distances, and scattered
+        // plus trailing cells are empty (INT32_MIN).
+        std::vector<int32_t> kpos(kv * n_streams, INT32_MIN);
+        std::vector<int32_t> qpos(nb * n_streams, 0);
+
+        const int64_t q_base = kv - std::min<int64_t>(kv / 4, extent / 2) + extent;
+        for (int64_t st = 0; st < n_streams; ++st) {
+            const int64_t st_shift = st * 17;
+            const int64_t n_live   = kv - std::min<int64_t>(kv / 8, (int64_t) (5 + st * 3));
+            for (int64_t i = 0; i < kv; ++i) {
+                if (i >= n_live || (i > 128 && ((i + st * 7) % 19 == 0))) {
+                    kpos[st * kv + i] = INT32_MIN;
+                } else if (i < 128) {
+                    // Guaranteed far tiles (dist >= extent) for all queries
+                    kpos[st * kv + i] = (int32_t) (st_shift + i);
+                } else {
+                    // Mix near (0 <= dist < extent) and far positions around q_base
+                    kpos[st * kv + i] = (int32_t) (st_shift + q_base - extent + (i - 128));
+                }
+            }
+            for (int64_t j = 0; j < nb; ++j) {
+                qpos[st * nb + j] = (int32_t) (st_shift + q_base + (j % std::max<int64_t>(1, extent)));
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (strcmp(t->name, "k_pos") == 0) {
+                ggml_backend_tensor_set(t, kpos.data(), 0, kpos.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                ggml_backend_tensor_set(t, qpos.data(), 0, qpos.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "s") == 0) {
+                if (nonzero_sinks) {
+                    init_tensor_uniform(t, -4.0f, 4.0f);
+                } else {
+                    std::vector<float> z(ggml_nelements(t), 0.0f);
+                    ggml_backend_tensor_set(t, z.data(), 0, z.size() * sizeof(float));
+                }
+            } else if (strcmp(t->name, "v") == 0 && const_v > 0.0f) {
+                std::vector<float> vf(ggml_nelements(t), const_v);
+                std::vector<uint8_t> vbuf(ggml_nbytes(t));
+                ggml_quantize_chunk(t->type, vf.data(), vbuf.data(), 0, ggml_nrows(t), t->ne[0], nullptr);
+                ggml_backend_tensor_set(t, vbuf.data(), 0, vbuf.size());
+            } else if (strcmp(t->name, "rel_table") == 0) {
+                std::vector<float> tbl(ggml_nelements(t));
+                for (float & x : tbl) {
+                    x = dis_bias(gen);
+                }
+                ggml_backend_tensor_set(t, tbl.data(), 0, tbl.size() * sizeof(float));
+            } else if (strcmp(t->name, "m") == 0) {
+                const int64_t m_streams = t->ne[3];
+                std::vector<ggml_fp16_t> h(kv * nb * m_streams);
+                for (int64_t st = 0; st < m_streams; ++st) {
+                    for (int64_t j = 0; j < nb; ++j) {
+                        const int32_t qp = qpos[st * nb + j];
+                        for (int64_t i = 0; i < kv; ++i) {
+                            const int32_t kp = kpos[st * kv + i];
+                            // Mask empty cells and future positions, keeping one valid key guaranteed
+                            const bool masked = (kp == INT32_MIN) || (kp > qp && i > 0);
+                            h[(st * nb + j) * kv + i] = ggml_fp32_to_fp16(masked ? -INFINITY : 0.0f);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -13651,6 +13799,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4096, 1280, nb, n_slices));
         }
     }
+
+    // flash attention with on-the-fly relative-position bias (Inkling-2)
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_F8_E4M3}) {
+        for (int64_t nb : {1, 16, 512}) {
+            for (int64_t n_streams : {1, 3}) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel_bias(128, 2, 3, 256, nb, n_streams, 64, type_KV));
+            }
+        }
+        // Full Inkling-2 head layout (24 Q / 8 KV, GQA 3), non-64-aligned KV length,
+        // non-tile-multiple prefill (nb=65), and broadcast-stream mask (mask->ne[3]==1, Q->ne[3]==3)
+        test_cases.emplace_back(new test_flash_attn_ext_rel_bias(128, 8, 3, 256, 16, 2, 64, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_bias(128, 2, 3, 150, 16, 2, 64, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_bias(128, 2, 3, 256, 65, 2, 64, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_bias(128, 2, 3, 256, 64, 3, 64, type_KV, true));
+    }
+    // High-finite constant V (checks FP32 combine against FP16 overflow), nonzero sinks with GQA 3, and large KV=512 (nb=1, n_streams=1 -> CPU split-KV)
+    test_cases.emplace_back(new test_flash_attn_ext_rel_bias(128, 2, 3, 256, 16, 2, 64, GGML_TYPE_F16, false, true,  500.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_rel_bias(128, 2, 3, 512,  1, 1, 64, GGML_TYPE_F16, false, true,    0.0f));
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));

@@ -2283,6 +2283,16 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // On-the-fly relative-position bias for Inkling-2:
+    //   rel_table: [extent + 1, n_head, n_tps, n_stream] (F32, row `extent` = -sink(q, h))
+    //   k_pos:     [n_kv_cols, n_stream] (I32, INT32_MIN for empty/padded cells)
+    //   q_pos:     [n_tps, n_stream]     (I32, query positions)
+    GGML_API void ggml_flash_attn_ext_add_rel_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * rel_table,
+            struct ggml_tensor * k_pos,
+            struct ggml_tensor * q_pos);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,

@@ -8973,6 +8973,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
+        const ggml_tensor * rel_table = dst->src[6];
+        const ggml_tensor * k_pos_t   = dst->src[7];
+        const ggml_tensor * q_pos_t   = dst->src[8];
+        const int64_t rel_extent = rel_table ? rel_table->ne[0] - 1 : 0;
+        const float   * rel_row  = rel_table ? (const float *) ((const char *) rel_table->data + iq2*rel_table->nb[1] + iq1*rel_table->nb[2] + iq3*rel_table->nb[3]) : nullptr;
+        const int32_t * kp_row   = k_pos_t   ? (const int32_t *) ((const char *) k_pos_t->data + iq3*k_pos_t->nb[1]) : nullptr;
+        const int32_t   qp       = q_pos_t   ? ((const int32_t *) ((const char *) q_pos_t->data + iq3*q_pos_t->nb[1]))[iq1] : 0;
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -9000,6 +9008,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             }
 
             s += mv; // apply mask
+            if (rel_row) {
+                const int32_t kp = kp_row[ic];
+                const int64_t dist = (kp == INT32_MIN) ? -1 : (int64_t) qp - (int64_t) kp;
+                const int64_t d = (dist >= 0 && dist < rel_extent) ? dist : rel_extent;
+                s += rel_row[d];
+            }
 
             const float Mold = M;
 
@@ -9554,7 +9568,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
         bool use_tiled = !use_ref &&
-                               (q->type == GGML_TYPE_F32 &&
+                               (dst->src[6] == nullptr &&
+                                q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
                                 neq1 >= Q_TILE_SZ);
