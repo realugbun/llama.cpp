@@ -57,6 +57,25 @@
 > They report that all 20,882 `test-backend-ops` cases pass, including the `INKLING2_*` ones, and that spot-check
 > prompts came back correct.
 
+> [!NOTE]
+> **Branch `inkling2-speed-metal`: the same fusions on Apple Silicon.** One commit on top of `inkling2-speed` ports
+> the Inkling 2 glue chains to the Metal backend (`ggml/src/ggml-metal/`): CLIP, CONV_STATE, CONV_DYN, CTRL_TAIL, SITU,
+> RELBIAS and MIX. Build with `-DGGML_METAL=ON` (the default on macOS); nothing needs to be enabled at runtime.
+>
+> Apple M6 (base, 24 GB), Inkling-2-Mini-Uncensored-AD-IQ3_S, `llama-bench -fa 1 -ngl 99`, f16 KV, tokens/s:
+>
+> | | upstream b12608 | `inkling2-speed` | `inkling2-speed-metal` |
+> |---|---:|---:|---:|
+> | decode (tg128) | 28.8 | 29.4 | 33.9 (+18%) |
+> | prefill (pp512) | 316 | 333 | 444 (+40%) |
+> | decode @ 8K | 25.9 | - | 29.9 (+15%) |
+> | prefill @ 8K | 198 | - | 311 (+57%) |
+>
+> Kernel dispatches per decoded token go from about 6,900 to 2,500. CONV_STATE, CONV_DYN, CTRL_TAIL, SITU and RELBIAS
+> give the same bits as the unfused Metal kernels; CLIP and MIX differ in the last bits (perplexity KLD against
+> upstream 0.002, same top token 98.4-99.1%). `test-backend-ops -o INKLING2_*` passes on `MTL0`. Measured on one Mac;
+> other Apple chips are untested.
+
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
