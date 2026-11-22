@@ -713,6 +713,103 @@ typedef struct {
 } ggml_metal_kargs_snake;
 
 typedef struct {
+    int32_t  ne00;     // row length
+    int32_t  ne01;
+    int32_t  nrows;
+    int32_t  s_ne1;    // 0: no scale, 1: per-element scale broadcast over rows, ne01: per (i0, i1)
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne02;
+    float    eps;
+    float    thr;
+    float    lo;
+    float    hi;
+} ggml_metal_kargs_l2_clip;
+
+typedef struct {
+    int32_t  d;
+    int32_t  n_c;
+    int32_t  n_t;
+    int32_t  n;
+    uint64_t past_nb1;
+    uint64_t past_nb2;
+    uint64_t cur_nb0;
+    uint64_t cur_nb1;
+    uint64_t cur_nb2;
+    uint64_t w_nb1;
+    uint64_t cell_nb1;
+    float    s0;
+    float    s1;
+    int32_t  has_res;
+} ggml_metal_kargs_conv_state;
+
+typedef struct {
+    int32_t  n_c;
+    int32_t  n_t;
+    int32_t  n_h;
+    uint64_t past_nb1;
+    uint64_t cur_nb0;
+    uint64_t cur_nb1;
+    uint64_t w_nb1;
+    uint64_t tap_nb1;
+    uint64_t tap_nb2;
+    float    s0;
+    float    s1;
+} ggml_metal_kargs_conv_dyn;
+
+typedef struct {
+    int32_t  L;      // states, the last one is rms_norm(x)
+    int32_t  nq;
+    float    eps;
+    float    scale;
+    uint64_t x_nb2;
+    uint64_t p_nb1;
+    uint64_t p_nb2;
+} ggml_metal_kargs_mix;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    uint64_t nb_c;
+    uint64_t nb_f;
+    uint64_t nb_g;
+    uint64_t nb_m;
+} ggml_metal_kargs_ctrl_tail;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t g_nb1;
+    uint64_t g_nb2;
+    uint64_t u_nb1;
+    uint64_t u_nb2;
+    float    s0, b0, s1, b1, s2, b2, s3, b3;
+} ggml_metal_kargs_situ;
+
+typedef struct {
+    int32_t  n_kv;
+    int32_t  n_tt;
+    int32_t  n_h;
+    int32_t  n_s;
+    uint64_t tbl_nb1;
+    uint64_t tbl_nb2;
+    uint64_t snk_nb1;
+    uint64_t snk_nb2;
+    uint64_t rel_nb1;
+    uint64_t m_nb1;
+    uint64_t m_nb2;
+    uint64_t m_nb3;
+    int32_t  m_ne2;
+    int32_t  m_f16;
+    uint64_t d_nb1;
+    uint64_t d_nb2;
+    uint64_t d_nb3;
+    int32_t  d_f16;
+} ggml_metal_kargs_relbias;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;

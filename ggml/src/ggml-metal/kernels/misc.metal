@@ -539,6 +539,286 @@ template [[host_name("kernel_snake_f16")]]  kernel void kernel_snake<half>(const
 template [[host_name("kernel_snake_bf16")]] kernel void kernel_snake<bfloat>(constant ggml_metal_kargs_snake &, device const bfloat *, device const float *, device const float *, device bfloat *, uint, uint, uint);
 #endif
 
+kernel void kernel_inkling2_l2_clip_f32(
+        constant ggml_metal_kargs_l2_clip & args,
+        device const char  * x,
+        device const float * s,
+        device       float * dst,
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort nsg   [[simdgroups_per_threadgroup]]) {
+    // one simdgroup per row, ne00 % 4 == 0 and ne00 <= 128: lane i owns elements [4i, 4i + 4)
+    // the reduction mirrors kernel_sum_rows_f32_f32_4 (one float4 per lane, simd_sum, sum) so the result is bit-identical
+    const int r = tgpig*nsg + sgitg;
+    if (r >= args.nrows) {
+        return;
+    }
+    const int i1 = r % args.ne01;
+    const int i2 = (r / args.ne01) % args.ne02;
+    const int i3 = r / (args.ne01*args.ne02);
+    device const float4 * xr = (device const float4 *) (x + i1*args.nb01 + i2*args.nb02 + i3*args.nb03);
+    device const float4 * sr = args.s_ne1 == 0 ? nullptr : (device const float4 *) (s + (args.s_ne1 == 1 ? 0 : i1)*args.ne00);
+    device       float4 * dr = (device float4 *) (dst + (int64_t) r*args.ne00);
+
+    const int n4 = args.ne00/4;
+    float4 y = 0.0f;
+    if (tiisg < n4) {
+        y = sr ? xr[tiisg]*sr[tiisg] : xr[tiisg];
+    }
+    const float4 s4 = simd_sum(y*y);
+    const float sumf   = sum(s4);
+    const float norm   = sqrt(sumf)*1.0f + args.eps;
+    const float factor = clamp(args.thr/norm, args.lo, args.hi);
+    if (tiisg < n4) {
+        dr[tiisg] = y*factor;
+    }
+}
+
+// Inkling 2 short convolution with its state store, one thread per output element (c, t, s)
+kernel void kernel_inkling2_conv_state_f32(
+        constant ggml_metal_kargs_conv_state & args,
+        device const char  * past,
+        device const char  * cur,
+        device const char  * w,
+        device const float * r,
+        device const float * res,
+        device       char  * cell,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if ((int) gid >= args.n) {
+        return;
+    }
+    const int c = gid % args.n_c;
+    const int t = (gid / args.n_c) % args.n_t;
+    const int s = gid / (args.n_c*args.n_t);
+    const int d = args.d;
+
+    device const float * pr = (device const float *) (past + c*args.past_nb1 + s*args.past_nb2);
+    device const char  * cr = cur + c*args.cur_nb1 + s*args.cur_nb2;
+    device const float * wr = (device const float *) (w + c*args.w_nb1);
+
+    float x[8];
+    for (int k = 0; k < d; ++k) {
+        const int j = t + k;
+        x[k] = j < d - 1 ? pr[j] : *((device const float *) (cr + (j - (d - 1))*args.cur_nb0));
+    }
+    // the order of kernel_ssm_conv_f32_f32(_4)
+    float sumf = 0.0f;
+    if (d % 4 == 0) {
+        for (int k = 0; k < d; k += 4) {
+            sumf += dot(float4(x[k], x[k+1], x[k+2], x[k+3]), float4(wr[k], wr[k+1], wr[k+2], wr[k+3]));
+        }
+    } else {
+        for (int k = 0; k < d; ++k) {
+            sumf += x[k]*wr[k];
+        }
+    }
+    if (t == 0) {
+        device float * cl = (device float *) (cell + s*args.cell_nb1) + c*(d - 1);
+        for (int k = 0; k < d - 1; ++k) {
+            const int j = args.n_t + k;
+            cl[k] = j < d - 1 ? pr[j] : *((device const float *) (cr + (j - (d - 1))*args.cur_nb0));
+        }
+    }
+    const float y = args.s0 * (r[gid] + sumf) + args.s1;
+    dst[gid] = args.has_res ? res[gid] + y : y;
+}
+
+// Inkling 2 dynamic short convolution (d = 4, one sequence) with its state store
+kernel void kernel_inkling2_conv_dyn_f32(
+        constant ggml_metal_kargs_conv_dyn & args,
+        device const char  * past,
+        device const char  * cur,
+        device const char  * w,
+        device const char  * tap,
+        device const float * r,
+        device       float * cell,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if ((int) gid >= args.n_c*args.n_t) {
+        return;
+    }
+    const int c = gid % args.n_c;
+    const int t = gid / args.n_c;
+    const int h = c / (args.n_c/args.n_h);
+    device const float * pr = (device const float *) (past + c*args.past_nb1);
+    device const char  * cr = cur + c*args.cur_nb1;
+    device const float * wr = (device const float *) (w + c*args.w_nb1);
+    float x[4];
+    for (int k = 0; k < 4; ++k) {
+        const int j = t + k;
+        x[k] = j < 3 ? pr[j] : *((device const float *) (cr + (j - 3)*args.cur_nb0));
+    }
+    float out = 0.0f;
+    out += dot(float4(x[0], x[1], x[2], x[3]), float4(wr[0], wr[1], wr[2], wr[3]));
+    device const float * tp = (device const float *) (tap + h*args.tap_nb1 + t*args.tap_nb2);
+    for (int l = 0; l < 4; ++l) {
+        out = out + metal::precise::fma(x[3 - l], tp[l], 0.0f);
+    }
+    if (t == 0) {
+        for (int k = 0; k < 3; ++k) {
+            const int j = args.n_t + k;
+            cell[c*3 + k] = j < 3 ? pr[j] : *((device const float *) (cr + (j - 3)*args.cur_nb0));
+        }
+    }
+    dst[gid] = args.s0 * (r[gid] + out) + args.s1;
+}
+
+// Inkling 2 attention over depth, one threadgroup of 576 threads per token, one float4 of the 2304 per thread.
+// The norm of x replicates kernel_rms_norm_f32_4 (576 threads); the dot products and the mix sum in another order.
+kernel void kernel_inkling2_mix_f32(
+        constant ggml_metal_kargs_mix & args,
+        device const char   * x,
+        device const char   * p,
+        device const float4 * q,
+        device       float4 * dst,
+        threadgroup  float  * shmem [[threadgroup(0)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tpitg [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int t  = tgpig;
+    const int i  = tpitg;          // float4 index, 0..575
+    const int L  = args.L;
+    const int nq = args.nq;
+
+    if (sgitg == 0) {
+        shmem[tiisg] = 0.0f;
+    }
+    const float4 xv = ((device const float4 *) (x + t*args.x_nb2))[i];
+    float sumf = dot(xv, xv);
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem[tiisg];
+    sumf = simd_sum(sumf);
+    const float mean = sumf/2304;
+    const float scl  = 1.0f/sqrt(mean + args.eps);
+    const float4 xn  = xv*scl;
+
+    float4 st[16];
+    for (int l = 0; l < L - 1; ++l) {
+        st[l] = ((device const float4 *) (p + l*args.p_nb1 + t*args.p_nb2))[i];
+    }
+    st[L - 1] = xn;
+
+    // partial dot products, reduced over the 18 simdgroups
+    threadgroup float * red = shmem + 32;   // [18][64]
+    for (int j = 0; j < L*nq; ++j) {
+        const int l = j % L, k = j / L;
+        float d = simd_sum(dot(st[l], q[k*576 + i]));
+        if (tiisg == 0) {
+            red[sgitg*64 + j] = d;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float * sc = shmem + 32 + 18*64;   // [64]
+    if (i < L*nq) {
+        float s = 0.0f;
+        for (int g = 0; g < 18; ++g) {
+            s += red[g*64 + i];
+        }
+        sc[i] = s*args.scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int k = 0; k < nq; ++k) {
+        float mx = -INFINITY;
+        for (int l = 0; l < L; ++l) mx = max(mx, sc[k*L + l]);
+        float w[16]; float sum = 0.0f;
+        for (int l = 0; l < L; ++l) { w[l] = exp(sc[k*L + l] - mx); sum += w[l]; }
+        float4 acc = 0.0f;
+        for (int l = 0; l < L; ++l) acc += st[l]*(w[l]/sum);
+        dst[(t*nq + k)*576 + i] = acc;
+    }
+}
+
+// Inkling 2 loop controller output: (c - tanh(f)*c) + tanh(g)*m
+kernel void kernel_inkling2_ctrl_tail_f32(
+        constant ggml_metal_kargs_ctrl_tail & args,
+        device const char * c,
+        device const char * f,
+        device const char * g,
+        device const char * m,
+        device      float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if ((int) gid >= args.ne0*args.ne1) {
+        return;
+    }
+    const int i0 = gid % args.ne0;
+    const int i1 = gid / args.ne0;
+    const float cv = ((device const float *) (c + i1*args.nb_c))[i0];
+    const float tf = precise::tanh(((device const float *) (f + i1*args.nb_f))[i0]);
+    const float tg = precise::tanh(((device const float *) (g + i1*args.nb_g))[i0]);
+    const float mv = ((device const float *) (m + i1*args.nb_m))[i0];
+    // keep the roundings of the unfused MUL, SUB, MUL, ADD kernels: no contraction into fma
+    const float a  = metal::precise::fma(tf, cv, 0.0f);
+    const float b  = cv - a;
+    const float e  = metal::precise::fma(tg, mv, 0.0f);
+    dst[gid] = b + e;
+}
+
+// Inkling 2 SiTU expert activation; the scales keep the a*x + b form of kernel_unary (SCALE)
+kernel void kernel_inkling2_situ_f32(
+        constant ggml_metal_kargs_situ & args,
+        device const char * g,
+        device const char * u,
+        device      float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if ((int) gid >= args.ne0*args.ne1*args.ne2) {
+        return;
+    }
+    const int i0 = gid % args.ne0;
+    const int i1 = (gid / args.ne0) % args.ne1;
+    const int i2 = gid / (args.ne0*args.ne1);
+    const float x = ((device const float *) (g + i1*args.g_nb1 + i2*args.g_nb2))[i0];
+    const float y = ((device const float *) (u + i1*args.u_nb1 + i2*args.u_nb2))[i0];
+    const float a0 = args.s0 * x + args.b0;
+    const float t0 = precise::tanh(a0);
+    const float a1 = args.s1 * t0 + args.b1;
+    const float sg = 1 / (1 + exp(-x));
+    const float ac = metal::precise::fma(a1, sg, 0.0f);
+    const float c0 = args.s2 * y + args.b2;
+    const float t1 = precise::tanh(c0);
+    const float c1 = args.s3 * t1 + args.b3;
+    dst[gid] = ac*c1;
+}
+
+// Inkling 2 relative-position bias added to the attention mask
+kernel void kernel_inkling2_relbias(
+        constant ggml_metal_kargs_relbias & args,
+        device const char * tbl,
+        device const char * snk,
+        device const char * rel,
+        device const char * mask,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const int n = args.n_kv*args.n_tt*args.n_h*args.n_s;
+    if ((int) gid >= n) {
+        return;
+    }
+    const int kv = gid % args.n_kv;
+    const int tt = (gid / args.n_kv) % args.n_tt;
+    const int h  = (gid / (args.n_kv*args.n_tt)) % args.n_h;
+    const int s  = gid / (args.n_kv*args.n_tt*args.n_h);
+    const int t  = tt + s*args.n_tt;
+    const int r  = ((device const int32_t *) (rel + t*args.rel_nb1))[kv];
+    const float b  = ((device const float *) (tbl + h*args.tbl_nb1 + t*args.tbl_nb2))[r];
+    const float sk = *((device const float *) (snk + h*args.snk_nb1 + t*args.snk_nb2));
+    device const char * mr = mask + tt*args.m_nb1 + (args.m_ne2 == 1 ? 0 : h)*args.m_nb2 + s*args.m_nb3;
+    const float m  = args.m_f16 ? (float) ((device const half *) mr)[kv] : ((device const float *) mr)[kv];
+    const float v  = (b - sk) + m;
+    device char * dr = dst + tt*args.d_nb1 + h*args.d_nb2 + s*args.d_nb3;
+    if (args.d_f16) {
+        ((device half *) dr)[kv] = (half) v;
+    } else {
+        ((device float *) dr)[kv] = v;
+    }
+}
+
 template<int N, typename src_t>
 kernel void kernel_fwht(
         constant ggml_metal_kargs_fwht & args,
