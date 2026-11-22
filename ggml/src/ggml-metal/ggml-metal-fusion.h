@@ -20,7 +20,7 @@ struct ggml_metal_device_props;
 
 // the maximum number of nodes that can be fused in a single kernel
 // (also the maximum length of a packed fusion group during graph optimization)
-#define GGML_METAL_FUSION_MAX 16
+#define GGML_METAL_FUSION_MAX 64
 
 typedef enum ggml_metal_fusion_mode {
     // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
@@ -43,6 +43,13 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
+    GGML_METAL_FUSION_L2_CLIP,      // [MUL] + SQR + SUM_ROWS + SQRT + SCALE + FILL + DIV + CLAMP + MUL (row L2 clip)
+    GGML_METAL_FUSION_CONV_STATE,   // CONCAT + CPY + SSM_CONV + ADD + SCALE [+ ADD] (Inkling 2 short conv + state store)
+    GGML_METAL_FUSION_CTRL_TAIL,    // TANH + MUL + SUB + TANH + MUL + ADD (Inkling 2 loop controller output)
+    GGML_METAL_FUSION_SITU,         // SCALE TANH SCALE SIGMOID MUL SCALE TANH SCALE MUL (Inkling 2 expert activation)
+    GGML_METAL_FUSION_RELBIAS,      // SUB CONT GET_ROWS CONT ADD CPY (Inkling 2 relative-position mask)
+    GGML_METAL_FUSION_CONV_DYN,     // CONV_STATE with 4 input-dependent taps per head (Inkling 2 full-attention K/V)
+    GGML_METAL_FUSION_MIX,          // RMS_NORM [CONCAT] CONT REPEAT MUL_MAT SOFT_MAX MUL_MAT (Inkling 2 attention over depth)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
